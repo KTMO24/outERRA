@@ -1,46 +1,3 @@
-"""
-outERRA Framework
-by Travis Michael O’Dell 2025
-All rights reserved.
-"""
-
-import asyncio
-import json
-import os
-import time
-import subprocess
-import threading
-import queue
-import inspect
-import random
-import logging
-from datetime import datetime
-from typing import Dict, List, Optional, Callable, Any
-from pathlib import Path
-from enum import Enum
-from dataclasses import dataclass
-
-import nbformat
-from nbformat.v4 import new_notebook, new_code_cell, new_markdown_cell
-from jupyter_client import KernelManager
-
-import ipywidgets as widgets
-from IPython.display import display, clear_output, HTML
-
-import requests
-
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from flask_socketio import SocketIO, emit
-
-# -------------------- Backend Components --------------------
-
-# Configure Logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# Event and State Management
-class ExecutionState(Enum):
-    IDLE = "idle"
     RUNNING = "running"
     PAUSED = "paused"
     ERROR = "error"
@@ -56,10 +13,11 @@ class EventBus:
     """Central event management system with WebSocket support."""
     def __init__(self, socketio: SocketIO):
         self.subscribers: Dict[str, List[Callable[[ExecutionEvent], None]]] = {}
-        self.event_queue = asyncio.Queue()
+        self.event_queue = queue.Queue()
         self.running = True
         self.socketio = socketio
-        asyncio.create_task(self._event_processor())
+        self.thread = threading.Thread(target=self._event_processor, daemon=True)
+        self.thread.start()
 
     def subscribe(self, event_type: str, callback: Callable[[ExecutionEvent], None]):
         if event_type not in self.subscribers:
@@ -69,12 +27,12 @@ class EventBus:
     def subscribe_all(self, callback: Callable[[ExecutionEvent], None]):
         self.subscribers.setdefault("all", []).append(callback)
 
-    async def publish(self, event: ExecutionEvent):
-        await self.event_queue.put(event)
+    def publish(self, event: ExecutionEvent):
+        self.event_queue.put(event)
 
-    async def _event_processor(self):
+    def _event_processor(self):
         while self.running:
-            event = await self.event_queue.get()
+            event = self.event_queue.get()
             # Handle specific event type subscribers
             if event.type in self.subscribers:
                 for callback in self.subscribers[event.type]:
@@ -89,6 +47,11 @@ class EventBus:
                         callback(event)
                     except Exception as e:
                         logging.error(f"Error in 'all' event callback: {str(e)}")
+            # Broadcast the event via SocketIO
+            self.socketio.emit('event', {
+                "type": event.type,
+                "data": event.data
+            })
 
 # JupyterRobot Class
 class JupyterRobot:
@@ -175,10 +138,10 @@ class JupyterRobot:
         self._save_state(state)
 
         # Publish event
-        asyncio.create_task(self.event_bus.publish(ExecutionEvent(
+        self.event_bus.publish(ExecutionEvent(
             type="task_created",
             data={"task_id": task_id, "task_name": task_name}
-        )))
+        ))
 
         logging.info(f"Task created: {task_id}")
         return task_id
@@ -203,10 +166,10 @@ class JupyterRobot:
             self._update_task_status(task_id, "completed")
 
             # Publish event
-            asyncio.create_task(self.event_bus.publish(ExecutionEvent(
+            self.event_bus.publish(ExecutionEvent(
                 type="task_completed",
                 data={"task_id": task_id}
-            )))
+            ))
 
             logging.info(f"Task completed: {task_id}")
 
@@ -214,10 +177,10 @@ class JupyterRobot:
             self._update_task_status(task_id, "failed")
 
             # Publish event
-            asyncio.create_task(self.event_bus.publish(ExecutionEvent(
+            self.event_bus.publish(ExecutionEvent(
                 type="task_failed",
                 data={"task_id": task_id, "error": str(e)}
-            )))
+            ))
 
             logging.error(f"Task failed: {task_id} with error: {str(e)}")
             raise Exception(f"Failed to execute notebook: {str(e)}")
@@ -334,13 +297,10 @@ class ExecutionController:
     def execute_task(self, task_id: str, priority: int = 1):
         """Schedule a task for execution with priority"""
         self.task_queue.put((priority, task_id))
-        asyncio.run_coroutine_threadsafe(
-            self.event_bus.publish(ExecutionEvent(
-                type="task_scheduled",
-                data={"task_id": task_id, "priority": priority}
-            )),
-            asyncio.get_event_loop()
-        )
+        self.event_bus.publish(ExecutionEvent(
+            type="task_scheduled",
+            data={"task_id": task_id, "priority": priority}
+        ))
 
     def _task_processor(self):
         """Continuously process tasks from the queue"""
@@ -546,8 +506,8 @@ class InterfaceManager:
         self.active_interfaces: Dict[str, Any] = {}
         self.interface_states: Dict[str, dict] = {}
 
-    async def register_interface(self, interface_id: str, interface_type: str):
-        """Register a new interface for interaction"""
+    def register_interface_sync(self, interface_id: str, interface_type: str):
+        """Register a new interface for interaction synchronously"""
         if interface_id in self.active_interfaces:
             raise ValueError(f"Interface {interface_id} already registered")
 
@@ -567,14 +527,8 @@ class InterfaceManager:
         if interface_type == "notebook":
             return {
                 "execute": self.controller.execute_task,
-                "get_status": self.notebook_controller.get_task_status,
-                "query_ai": self.controller.robot.query_gemini,
-                "create_notebook": self.notebook_controller.create_notebook,
-                "insert_cell": self.notebook_controller.insert_cell,
-                "update_cell": self.notebook_controller.update_cell,
-                "delete_cell": self.notebook_controller.delete_cell,
-                "save_notebook": self.notebook_controller.save_notebook,
-                "execute_cell": self.notebook_controller.execute_cell
+                "get_status": self.controller.robot.get_task_status,
+                "query_ai": self.controller.robot.query_gemini
             }
         elif interface_type == "monitoring":
             return {
@@ -585,8 +539,8 @@ class InterfaceManager:
         else:
             raise ValueError(f"Unknown interface type: {interface_type}")
 
-    async def call_interface(self, interface_id: str, method: str, *args, **kwargs):
-        """Call a method on a registered interface"""
+    def call_interface_sync(self, interface_id: str, method: str, *args, **kwargs):
+        """Call a method on a registered interface synchronously"""
         if interface_id not in self.active_interfaces:
             raise ValueError(f"Interface {interface_id} not registered")
 
@@ -594,7 +548,7 @@ class InterfaceManager:
         if method not in interface:
             raise ValueError(f"Method {method} not available on interface {interface_id}")
 
-        return await interface[method](*args, **kwargs)
+        return interface[method](*args, **kwargs)
 
 # ApplicationController Class
 class ApplicationController:
@@ -606,25 +560,24 @@ class ApplicationController:
         self.executor = ExecutionController(self.robot, self.event_bus)
         self.interface_manager = InterfaceManager(self.executor, self.notebook_controller)
         self.socketio = socketio
+        self.gui = None # Placeholder for GUI integration
 
     def start(self):
         """Initialize the application"""
         # Register default interfaces
-        asyncio.run_coroutine_threadsafe(
-            self.interface_manager.register_interface(
-                "main_notebook", "notebook"
-            ),
-            asyncio.get_event_loop()
+        self.interface_manager.register_interface_sync(
+            "main_notebook", "notebook"
         )
-        asyncio.run_coroutine_threadsafe(
-            self.interface_manager.register_interface(
-                "system_monitor", "monitoring"
-            ),
-            asyncio.get_event_loop()
+        self.interface_manager.register_interface_sync(
+            "system_monitor", "monitoring"
         )
 
         # Set up event handling for broadcasting events
         self.event_bus.subscribe_all(self._broadcast_event)
+
+        # Correctly reference get_task_status from JupyterRobot in interface methods
+        self.interface_manager.active_interfaces["main_notebook"]["get_status"] = self.robot.get_task_status
+        self.interface_manager.active_interfaces["main_notebook"]["query_ai"] = self.robot.query_gemini
 
     def _broadcast_event(self, event: ExecutionEvent):
         """Handle broadcasting events to WebSocket connections"""
@@ -632,6 +585,10 @@ class ApplicationController:
             "type": event.type,
             "data": event.data
         })
+
+    def set_gui(self, gui):
+        """Attach the GUI instance to this class"""
+        self.gui = gui
 
 # -------------------- Outerra Framework Components --------------------
 
@@ -702,28 +659,6 @@ class Shrub:
     def is_active(self):
         return True
 
-# Trunk Class (Already defined above)
-class Trunk:
-    def __init__(self, garden):
-        self.garden = garden
-        self.name = "trunk"
-        self.description = "Central trunk of the garden"
-        self.berries = {}
-        self.phylum = "core"
-        self.growth = "base"
-        self.load_berries()
-
-    def load_berries(self):
-        self.berries['logic_generator'] = LogicGeneratorBerry(self)
-
-    def run(self, job):
-        berry_name = job.get("berry")
-        if berry_name in self.berries:
-             return self.berries[berry_name].run(job)
-        else:
-             return {"status": "error", "message": f"Berry '{berry_name}' not found in the Trunk."}
-
-
 # Modular Logic for Self-Generation
 class LogicGeneratorBerry(Berry):
     def __init__(self, shrub):
@@ -792,15 +727,159 @@ class SelfGeneratingModule(Shrub):
         print(f"{self.name} initialized and ready for logic generation")
 
 # Dynamic GUI with ipywidgets
+import socket # Import the socket module
+
 class DynamicGUI:
-    def __init__(self, garden: Garden):
+    def __init__(self, garden: Garden, app_controller: ApplicationController):  # Add parameters back in
         self.garden = garden
+        self.app_controller = app_controller  # Store the ApplicationController
         self.output = widgets.Output()
         self.update_button = widgets.Button(description="Update Modules")
         self.update_button.on_click(self.update_modules)
         self.control_panel = widgets.VBox([self.update_button, self.output])
-        display(self.control_panel)
+        self.api_key_input = widgets.Text(description="Gemini API Key")
+        self.save_api_key_button = widgets.Button(description="Save API Key")
+        self.save_api_key_button.on_click(self.save_api_key)
+
+        self.task_name_input = widgets.Text(description="Task Name")
+        self.notebook_path_input = widgets.Text(description="Notebook Path")
+        self.dependencies_input = widgets.Text(description="Dependencies (comma-separated)")
+        self.create_task_button = widgets.Button(description="Create Task")
+        self.create_task_button.on_click(self.create_task)
+
+        self.task_id_input = widgets.Text(description="Task ID to Execute")
+        self.priority_input = widgets.IntText(description="Priority (1=High, 2=Medium, 3=Low)", value=1)
+        self.execute_task_button = widgets.Button(description="Execute Task")
+        self.execute_task_button.on_click(self.execute_task)
+        
+        self.task_status_input = widgets.Text(description="Task ID to Get Status")
+        self.get_task_status_button = widgets.Button(description="Get Task Status")
+        self.get_task_status_button.on_click(self.get_task_status)
+
+        self.status_area = widgets.Output()
+        self.monitor_area = widgets.Output()
+
+        self.tabs = widgets.Tab([
+            widgets.VBox([
+                self.api_key_input, self.save_api_key_button,
+                self.task_name_input, self.notebook_path_input, self.dependencies_input, self.create_task_button,
+                self.task_id_input, self.priority_input, self.execute_task_button,
+                self.task_status_input, self.get_task_status_button,
+                self.status_area
+            ]),
+            self.monitor_area
+        ])
+        self.tabs.set_title(0, 'Control')
+        self.tabs.set_title(1, 'Monitor')
+
+        
+        self.overall_control = widgets.VBox([
+            self.control_panel,
+            self.tabs
+        ])
+
+        display(self.overall_control)
+
+        self.load_api_key()  # Load the API key on initialization
         self.update_modules(None)  # Initial display
+        self.update_monitor_area()
+
+    def load_api_key(self):
+        """Load API key from environment variable"""
+        api_key = os.getenv("GEMINI_API_KEY")
+        if api_key:
+            self.api_key_input.value = api_key
+            self.app_controller.robot.gemini# ... (Previous code: Backend Components, Outerra Framework, etc.)
+
+# Dynamic GUI with ipywidgets (Continued)
+
+    def load_api_key(self):
+        """Load API key from environment variable"""
+        api_key = os.getenv("GEMINI_API_KEY")
+        if api_key:
+            self.api_key_input.value = api_key
+            self.app_controller.robot.gemini_api_key = api_key
+            with self.status_area:
+                print("Gemini API Key loaded from environment.")
+
+    def save_api_key(self, b):
+        """Save API key to environment variable and update robot"""
+        api_key = self.api_key_input.value
+        os.environ["GEMINI_API_KEY"] = api_key
+        self.app_controller.robot.gemini_api_key = api_key  # Update the running instance
+        with self.status_area:
+            print("Gemini API Key saved to environment and updated in the system.")
+
+    def create_task(self, b):
+        """Create a task through the GUI"""
+        task_name = self.task_name_input.value
+        notebook_path = self.notebook_path_input.value
+        dependencies_str = self.dependencies_input.value
+        dependencies = [dep.strip() for dep in dependencies_str.split(",") if dep.strip()]
+
+        if not task_name or not notebook_path:
+            with self.status_area:
+                print("Error: Task Name and Notebook Path are required.")
+            return
+
+        try:
+            task_id = self.app_controller.robot.create_task(task_name, notebook_path, dependencies)
+            with self.status_area:
+                print(f"Task created: {task_id}")
+            self.update_monitor_area()  # Refresh the monitor after creating a task
+        except Exception as e:
+            with self.status_area:
+                print(f"Error creating task: {e}")
+
+    def execute_task(self, b):
+        """Execute a task through the GUI"""
+        task_id = self.task_id_input.value
+        priority = self.priority_input.value
+
+        if not task_id:
+            with self.status_area:
+                print("Error: Task ID is required.")
+            return
+
+        try:
+            self.app_controller.executor.execute_task(task_id, priority)
+            with self.status_area:
+                print(f"Task execution started: {task_id} with priority {priority}")
+            self.update_monitor_area()  # Refresh monitor after executing a task
+        except Exception as e:
+            with self.status_area:
+                print(f"Error executing task: {e}")
+
+    def get_task_status(self, b):
+        """Get task status through the GUI"""
+        task_id = self.task_status_input.value
+
+        if not task_id:
+            with self.status_area:
+                print("Error: Task ID is required.")
+            return
+
+        try:
+            status = self.app_controller.robot.get_task_status(task_id)
+            with self.status_area:
+                print(f"Task status for {task_id}: {status}")
+        except Exception as e:
+            with self.status_area:
+                print(f"Error getting task status: {e}")
+                
+    def update_monitor_area(self):
+        """Update the monitor tab with current task statuses"""
+        with self.monitor_area:
+            clear_output()
+            state = self.app_controller.robot._load_state()
+            print("Active Tasks:")
+            for task_id in state["active_tasks"]:
+                task_status = self.app_controller.robot.get_task_status(task_id)
+                print(f"  - {task_id}: {task_status['status']}")
+            print("\nCompleted Tasks:")
+            for task_id in state["completed_tasks"]:
+                task_status = self.app_controller.robot.get_task_status(task_id)
+                print(f"  - {task_id}: {task_status['status']}")
 
     def update_modules(self, b):
         with self.output:
@@ -810,357 +889,29 @@ class DynamicGUI:
 
     def refresh(self):
         self.update_modules(None)
+        self.update_monitor_area()
 
 # -------------------- Flask Application --------------------
 
-# Embedded HTML, CSS, and JavaScript for the frontend
-# For simplicity, we embed the frontend as a multi-line string
-FRONTEND_HTML = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>outERRA Control Panel</title>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            margin: 20px;
-        }
-        #control-panel {
-            border: 1px solid #ccc;
-            padding: 20px;
-            border-radius: 5px;
-        }
-        #status-area {
-            margin-top: 20px;
-            height: 300px;
-            overflow-y: scroll;
-            border: 1px solid #eee;
-            padding: 10px;
-        }
-        .status-message {
-            padding: 5px;
-            border-bottom: 1px solid #eee;
-        }
-        #notebook-controls {
-          margin-top: 20px;
-          border: 1px solid #ccc;
-          padding: 10px;
-          border-radius: 5px;
-        }
-    </style>
-</head>
-<body>
-    <div id="control-panel">
-        <h2>outERRA Control Panel</h2>
-        <button id <!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>outERRA Control Panel</title>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            margin: 20px;
-        }
-        #control-panel {
-            border: 1px solid #ccc;
-            padding: 20px;
-            border-radius: 5px;
-        }
-        #status-area {
-            margin-top: 20px;
-            height: 300px;
-            overflow-y: scroll;
-            border: 1px solid #eee;
-            padding: 10px;
-        }
-        .status-message {
-            padding: 5px;
-            border-bottom: 1px solid #eee;
-        }
-        #notebook-controls {
-          margin-top: 20px;
-          border: 1px solid #ccc;
-          padding: 10px;
-          border-radius: 5px;
-        }
-    </style>
-</head>
-<body>
-    <div id="control-panel">
-        <h2>outERRA Control Panel</h2>
-        <button id="create-task-btn">Create Task</button>
-        <button id="execute-notebook-btn">Execute Notebook</button>
-        <div id="status-area"></div>
-    </div>
-    <div id="notebook-controls">
-        <h3>Notebook Operations</h3>
-        <button id="create-notebook-btn">Create Notebook</button>
-        <button id="insert-cell-btn">Insert Cell</button>
-        <button id="update-cell-btn">Update Cell</button>
-        <button id="delete-cell-btn">Delete Cell</button>
-        <button id="execute-cell-btn">Execute Cell</button>
-        <button id="save-notebook-btn">Save Notebook</button>
-    </div>
-
-
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.6.1/socket.io.min.js" integrity="sha512-UZ8CXuWX0UPYZPmk8TqsMd3F0vO3E4ZlzZh0pbupZHcS3S7Ht+YYIYdjYvjt5G+G/uufXCBYrbDsKkbj8FwCiw==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
-    <script>
-        // Initialize WebSocket connection using Socket.IO
-        const socket = io();
-
-        socket.on('connect', () => {
-            console.log("WebSocket connection established.");
-        });
-
-        socket.on('event', (data) => {
-            handleEvent(data);
-        });
-
-        socket.on('disconnect', () => {
-            console.log("WebSocket connection closed.");
-        });
-
-        // Event handling
-        function handleEvent(data) {
-            const { type, data: eventData } = data;
-            const statusArea = document.getElementById("status-area");
-
-            let message = "";
-            if (type === "task_created") {
-                message = `Task Created: ${eventData.task_id}`;
-            } else if (type === "task_completed") {
-                message = `Task Completed: ${eventData.task_id}`;
-            } else if (type === "task_failed") {
-                message = `Task Failed: ${eventData.task_id} - ${eventData.error}`;
-            } else if (type === "task_scheduled") {
-                message = `Task Scheduled: ${eventData.task_id} with priority ${eventData.priority}`;
-            }
-
-            if (message) {
-                const msgDiv = document.createElement("div");
-                msgDiv.className = "status-message";
-                msgDiv.textContent = message;
-                statusArea.prepend(msgDiv);
-            }
-        }
-
-        // Button handlers for task creation and execution
-        document.getElementById("create-task-btn").addEventListener("click", async () => {
-            const taskName = prompt("Enter Task Name:");
-            if (!taskName) return;
-            const notebookPath = prompt("Enter Notebook Path (relative to workspace):");
-            if (!notebookPath) return;
-            const dependenciesInput = prompt("Enter Dependencies (comma-separated task IDs):");
-            const dependencies = dependenciesInput ? dependenciesInput.split(",").map(dep => dep.trim()) : [];
-
-            const response = await fetch("/create_task/", {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json"
-                },
-                body: JSON.stringify({ task_name: taskName, notebook_path: notebookPath, dependencies })
-            });
-
-            const result = await response.json();
-            const statusArea = document.getElementById("status-area");
-            if (response.ok) {
-                statusArea.innerHTML += `<p>Task Created: ${result.task_id}</p>`;
-            } else {
-                statusArea.innerHTML += `<p style="color:red;">Error: ${result.error}</p>`;
-            }
-        });
-
-        document.getElementById("execute-notebook-btn").addEventListener("click", async () => {
-            const taskId = prompt("Enter Task ID to Execute:");
-            if (!taskId) return;
-            const priority = parseInt(prompt("Enter Priority (1=High, 2=Medium, 3=Low):"), 10) || 1;
-
-            const response = await fetch("/execute_notebook/", {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json"
-                },
-                body: JSON.stringify({ task_id: taskId, priority })
-            });
-
-            const result = await response.json();
-            const statusArea = document.getElementById("status-area");
-            if (response.ok) {
-                statusArea.innerHTML += `<p>Execution Started for Task: ${result.task_id} with Priority: ${priority}</p>`;
-            } else {
-                statusArea.innerHTML += `<p style="color:red;">Error: ${result.error}</p>`;
-            }
-        });
-
-       //Button Handlers for Notebook Operations
-        document.getElementById("create-notebook-btn").addEventListener("click", async () => {
-           const notebookId = prompt("Enter a Notebook ID:");
-           if(!notebookId) return;
-           const response = await fetch("/create_notebook/", {
-                method: "POST",
-                headers: {
-                   "Content-Type": "application/json"
-                },
-                body: JSON.stringify({ notebook_id: notebookId })
-            });
-           const result = await response.json();
-           const statusArea = document.getElementById("status-area");
-            if (response.ok) {
-                statusArea.innerHTML += `<p>Notebook Created: ${result.notebook_id} with ${result.cell_count} Cells </p>`;
-            } else {
-                statusArea.innerHTML += `<p style="color:red;">Error creating notebook: ${result.error}</p>`;
-            }
-        });
-
-        document.getElementById("insert-cell-btn").addEventListener("click", async () => {
-             const notebookId = prompt("Enter Notebook ID:");
-            if (!notebookId) return;
-            const cellType = prompt("Enter cell type ('code' or 'markdown'):");
-            if (!cellType) return;
-            const cellContent = prompt("Enter cell content:");
-            if (!cellContent) return;
-            const position = parseInt(prompt("Enter cell position (0 for beginning, leave blank for end):"), 10);
-
-            const response = await fetch("/insert_cell/", {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json"
-                },
-                body: JSON.stringify({
-                    notebook_id: notebookId,
-                    cell_content: { type: cellType, content: cellContent },
-                    position: isNaN(position) ? null : position
-                })
-            });
-
-            const result = await response.json();
-            const statusArea = document.getElementById("status-area");
-             if (response.ok) {
-                statusArea.innerHTML += `<p>Cell inserted into ${result.notebook_id} at index ${result.cell_index}</p>`;
-            } else {
-                statusArea.innerHTML += `<p style="color:red;">Error inserting cell: ${result.error}</p>`;
-            }
-        });
-
-        document.getElementById("update-cell-btn").addEventListener("click", async () => {
-             const notebookId = prompt("Enter Notebook ID:");
-            if (!notebookId) return;
-            const cellIndex = parseInt(prompt("Enter cell index to update:"), 10);
-             if(isNaN(cellIndex)) return;
-             const cellType = prompt("Enter cell type ('code' or 'markdown'):");
-            if (!cellType) return;
-            const cellContent = prompt("Enter new cell content:");
-            if (!cellContent) return;
-            const response = await fetch("/update_cell/", {
-                method: "POST",
-                headers: {
-                   "Content-Type": "application/json"
-                },
-                body: JSON.stringify({
-                   notebook_id: notebookId,
-                   cell_index: cellIndex,
-                   cell_content: {type: cellType, content: cellContent}
-                })
-            });
-             const result = await response.json();
-            const statusArea = document.getElementById("status-area");
-            if(response.ok){
-                statusArea.innerHTML += `<p>Cell at index ${result.cell_index} in notebook ${notebookId} updated</p>`
-            } else {
-                statusArea.innerHTML += `<p style="color:red;">Error updating cell: ${result.error}</p>`
-            }
-        });
-
-        document.getElementById("delete-cell-btn").addEventListener("click", async () => {
-            const notebookId = prompt("Enter Notebook ID:");
-            if (!notebookId) return;
-            const cellIndex = parseInt(prompt("Enter cell index to delete:"), 10);
-            if (isNaN(cellIndex)) return;
-
-            const response = await fetch("/delete_cell/", {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json"
-                },
-                body: JSON.stringify({ notebook_id: notebookId, cell_index: cellIndex })
-            });
-
-            const result = await response.json();
-            const statusArea = document.getElementById("status-area");
-              if(response.ok){
-                 statusArea.innerHTML += `<p>Cell at index ${result.cell_index} in notebook ${notebookId} deleted</p>`
-              }else {
-                 statusArea.innerHTML += `<p style="color:red;">Error deleting cell: ${result.error}</p>`
-              }
-        });
-
-       document.getElementById("execute-cell-btn").addEventListener("click", async () => {
-            const notebookId = prompt("Enter Notebook ID:");
-            if(!notebookId) return;
-           const cellIndex = parseInt(prompt("Enter cell index to execute:"), 10);
-            if(isNaN(cellIndex)) return;
-             const response = await fetch("/execute_cell/", {
-                 method: "POST",
-                headers: {
-                     "Content-Type": "application/json"
-                 },
-                 body: JSON.stringify({
-                     notebook_id: notebookId,
-                     cell_index: cellIndex
-                 })
-            });
-             const result = await response.json();
-             const statusArea = document.getElementById("status-area");
-               if(response.ok){
-                  statusArea.innerHTML += `<p> Cell at index ${result.cell_index} in notebook ${notebookId} executed. Message ID: ${result.msg_id}</p>`
-               }else {
-                   statusArea.innerHTML += `<p style="color:red;">Error executing cell: ${result.error}</p>`
-               }
-       });
-
-
-        document.getElementById("save-notebook-btn").addEventListener("click", async () => {
-            const notebookId = prompt("Enter Notebook ID:");
-            if (!notebookId) return;
-            const filepath = prompt("Enter the filepath to save notebook (.ipynb):");
-            if(!filepath) return;
-
-             const response = await fetch("/save_notebook/", {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json"
-                },
-               body: JSON.stringify({notebook_id: notebookId, filepath: filepath})
-            });
-             const result = await response.json();
-             const statusArea = document.getElementById("status-area");
-            if(response.ok){
-               statusArea.innerHTML += `<p>Notebook ${notebookId} saved to ${result.filepath}</p>`;
-            }else {
-                statusArea.innerHTML += `<p style="color:red;">Error saving notebook: ${result.error}</p>`;
-            }
-        });
-
-        // Optionally, you can implement polling or additional real-time features here
-    </script>
-</body>
-</html>
-"""
+# ... (Frontend HTML - No changes needed)
 
 # Initialize Flask app
 app_flask = Flask(__name__)
 CORS(app_flask)  # Enable CORS for all domains
 
 # Initialize Flask-SocketIO
-socketio = SocketIO(app_flask, cors_allowed_origins="*")
+socketio = SocketIO(app_flask, cors_allowed_origins="*", async_mode='threading')
 
 # Initialize ApplicationController
-# Adjust 'workspace_dir' and 'gemini_api_key' as necessary
 workspace_directory = "workspace"
-gemini_api_key = "YOUR_GEMINI_API_KEY"  # Replace with your actual Gemini API key
-app_controller = ApplicationController(workspace_dir=workspace_directory, gemini_api_key=gemini_api_key, socketio=socketio)
+# Note: Now the API key will be initially loaded from the environment variable in the GUI.
+gemini_api_key = ""  # Placeholder - will be set by GUI
+
+app_controller = ApplicationController(
+    workspace_dir=workspace_directory,
+    gemini_api_key=gemini_api_key,
+    socketio=socketio
+)
 
 # Initialize Garden with Outerra configuration
 outerra_config = {
@@ -1171,7 +922,8 @@ outerra_config = {
 garden = Garden(outerra_config)
 
 # Initialize Dynamic GUI
-gui = DynamicGUI(garden)
+gui = DynamicGUI(garden, app_controller)
+app_controller.set_gui(gui)  # Connect the GUI to the ApplicationController
 
 # Start ApplicationController
 def start_application():
@@ -1238,157 +990,6 @@ def get_task_status_endpoint(task_id):
         return jsonify(status), 200
     except FileNotFoundError:
         return jsonify({"error": f"Task ID {task_id} not found."}), 404
-
-#------ Notebook API endpoints ------
-@app_flask.route("/create_notebook/", methods=["POST"])
-def create_notebook_endpoint():
-   """
-   Create a new notebook
-    Expects JSON body with:
-    - notebook_id: str
-    """
-   data = request.get_json()
-   notebook_id = data.get("notebook_id")
-   if not notebook_id:
-       return jsonify({"error": "notebook_id is required"}), 400
-   try:
-       notebook_data = app_controller.notebook_controller.create_notebook(notebook_id)
-       return jsonify(notebook_data), 200
-   except Exception as e:
-       return jsonify({"error": str(e)}), 500
-
-@app_flask.route("/insert_cell/", methods=["POST"])
-def insert_cell_endpoint():
-   """
-   Insert a cell into a notebook
-   Expects JSON body with:
-        - notebook_id: str
-        - cell_content: { type: 'code' or 'markdown', content: str}
-        - position: int (optional)
-   """
-   data = request.get_json()
-   notebook_id = data.get("notebook_id")
-   cell_content = data.get("cell_content")
-   position = data.get("position")
-
-   if not notebook_id or not cell_content or not cell_content.get("type") or not cell_content.get("content"):
-        return jsonify({"error": "notebook_id, cell_content(type, content) are required"}), 400
-
-   try:
-       cell_data = app_controller.interface_manager.call_interface(
-           "main_notebook",
-           "insert_cell",
-           notebook_id,
-           cell_content,
-           position
-       )
-
-       return jsonify(asyncio.run(cell_data)), 200
-   except Exception as e:
-       return jsonify({"error": str(e)}), 500
-
-@app_flask.route("/update_cell/", methods=["POST"])
-def update_cell_endpoint():
-    """
-    Update content of a cell
-    Expects JSON body with:
-        - notebook_id: str
-        - cell_index: int
-        - cell_content: {type: 'code' or 'markdown', content: str}
-    """
-    data = request.get_json()
-    notebook_id = data.get("notebook_id")
-    cell_index = data.get("cell_index")
-    cell_content = data.get("cell_content")
-
-    if not notebook_id or cell_index is None or not cell_content or not cell_content.get("type") or not cell_content.get("content"):
-         return jsonify({"error": "notebook_id, cell_index, cell_content(type, content) are required."}), 400
-    try:
-        cell_data = app_controller.interface_manager.call_interface(
-            "main_notebook",
-            "update_cell",
-            notebook_id,
-            cell_index,
-            cell_content
-        )
-        return jsonify(asyncio.run(cell_data)), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app_flask.route("/delete_cell/", methods=["POST"])
-def delete_cell_endpoint():
-    """
-    Delete a cell from a notebook
-    Expects JSON body with:
-        - notebook_id: str
-        - cell_index: int
-    """
-    data = request.get_json()
-    notebook_id = data.get("notebook_id")
-    cell_index = data.get("cell_index")
-
-    if not notebook_id or cell_index is None:
-        return jsonify({"error": "notebook_id and cell_index are required"}), 400
-    try:
-        cell_data = app_controller.interface_manager.call_interface(
-            "main_notebook",
-            "delete_cell",
-            notebook_id,
-            cell_index
-        )
-        return jsonify(asyncio.run(cell_data)), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app_flask.route("/execute_cell/", methods=["POST"])
-def execute_cell_endpoint():
-    """
-    Execute a specific cell from a notebook
-    Expects JSON body with:
-        - notebook_id: str
-        - cell_index: int
-    """
-    data = request.get_json()
-    notebook_id = data.get("notebook_id")
-    cell_index = data.get("cell_index")
-
-    if not notebook_id or cell_index is None:
-        return jsonify({"error": "notebook_id and cell_index are required"}), 400
-    try:
-        cell_data = app_controller.interface_manager.call_interface(
-            "main_notebook",
-            "execute_cell",
-            notebook_id,
-            cell_index
-        )
-        return jsonify(asyncio.run(cell_data)), 200
-    except Exception as e:
-       return jsonify({"error": str(e)}), 500
-
-@app_flask.route("/save_notebook/", methods=["POST"])
-def save_notebook_endpoint():
-    """
-    Save notebook to file system
-    Expects JSON body with:
-        - notebook_id: str
-        - filepath: str
-    """
-    data = request.get_json()
-    notebook_id = data.get("notebook_id")
-    filepath = data.get("filepath")
-
-    if not notebook_id or not filepath:
-        return jsonify({"error": "notebook_id and filepath are required"}), 400
-    try:
-        notebook_data = app_controller.interface_manager.call_interface(
-            "main_notebook",
-            "save_notebook",
-            notebook_id,
-            filepath
-        )
-        return jsonify(asyncio.run(notebook_data)), 200
-    except Exception as e:
-       return jsonify({"error": str(e)}), 500
 
 # WebSocket Events
 
@@ -1462,124 +1063,24 @@ def get_task_status(task_id: str) -> Dict[str, Any]:
     response = requests.get(url)
     return response.json()
 
-def create_notebook_api(notebook_id: str) -> Dict[str, Any]:
-    """
-    Create a new notebook via the api
-    """
-    url = f"http://localhost:5000/create_notebook/"
-    payload = {"notebook_id": notebook_id}
-    response = requests.post(url, json=payload)
-    return response.json()
-
-def insert_cell_api(notebook_id: str, cell_type: str, cell_content: str, position: Optional[int] = None) -> Dict[str, Any]:
-    """
-    Insert a new cell into a notebook using the API.
-
-    Args:
-        notebook_id (str): ID of the notebook to modify.
-        cell_type (str): Type of the cell ('code' or 'markdown').
-        cell_content (str): Content of the cell.
-        position (int, optional): Position to insert the cell. Defaults to None (end).
-
-    Returns:
-        Dict[str, Any]: Response from the API.
-    """
-    url = f"http://localhost:5000/insert_cell/"
-    payload = {
-       "notebook_id": notebook_id,
-       "cell_content": {"type": cell_type, "content": cell_content},
-       "position": position
-    }
-    response = requests.post(url, json=payload)
-    return response.json()
-
-
-def update_cell_api(notebook_id: str, cell_index: int, cell_type: str, cell_content: str) -> Dict[str, Any]:
-    """
-    Update a cell content in a notebook using the API.
-
-    Args:
-        notebook_id (str): ID of the notebook to modify.
-        cell_index (int): Index of the cell to update.
-         cell_type (str): Type of the cell ('code' or 'markdown').
-        cell_content (str): New content of the cell.
-
-    Returns:
-        Dict[str, Any]: Response from the API.
-    """
-    url = f"http://localhost:5000/update_cell/"
-    payload = {
-        "notebook_id": notebook_id,
-        "cell_index": cell_index,
-        "cell_content": {"type": cell_type, "content": cell_content}
-    }
-    response = requests.post(url, json=payload)
-    return response.json()
-
-
-def delete_cell_api(notebook_id: str, cell_index: int) -> Dict[str, Any]:
-    """
-   Delete a cell from a notebook via the API.
-
-    Args:
-        notebook_id (str): ID of the notebook to modify.
-        cell_index (int): Index of the cell to delete.
-
-    Returns:
-        Dict[str, Any]: Response from the API.
-   """
-    url = f"http://localhost:5000/delete_cell/"
-    payload = {
-        "notebook_id": notebook_id,
-        "cell_index": cell_index
-    }
-    response = requests.post(url, json=payload)
-    return response.json()
-
-
-def execute_cell_api(notebook_id: str, cell_index: int) -> Dict[str, Any]:
-    """
-   Execute a specific cell in a notebook using the API.
-
-    Args:
-        notebook_id (str): ID of the notebook containing the cell.
-        cell_index (int): Index of the cell to execute.
-
-    Returns:
-        Dict[str, Any]: Response from the API.
-    """
-    url = f"http://localhost:5000/execute_cell/"
-    payload = {
-        "notebook_id": notebook_id,
-        "cell_index": cell_index
-    }
-    response = requests.post(url, json=payload)
-    return response.json()
-
-def save_notebook_api(notebook_id: str, filepath: str) -> Dict[str, Any]:
-    """
-    Save a notebook to the specified filepath using the API.
-
-    Args:
-        notebook_id (str): ID of the notebook to save.
-        filepath (str): Filesystem path where the notebook should be saved.
-
-    Returns:
-        Dict[str, Any]: Response from the API.
-    """
-    url = f"http://localhost:5000/save_notebook/"
-    payload = {
-        "notebook_id": notebook_id,
-        "filepath": filepath
-    }
-    response = requests.post(url, json=payload)
-    return response.json()
-
-
 # -------------------- Running the Flask Server --------------------
+import socket
+
+def is_port_available(port):
+    """Check if a port is available on localhost"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex(('localhost', port)) != 0
 
 def run_flask():
-    socketio.run(app_flask, host="0.0.0.0", port=5000)
+    """Start the Flask server on an available port"""
+    # Choose a random port between 49152 and 65535 (ephemeral ports)
+    while True:
+        port = random.randint(49152, 65535)
+        if is_port_available(port):
+            break
+
+    print(f"Starting Flask server on port {port}...")
+    socketio.run(app_flask, host="0.0.0.0", port=port, allow_unsafe_werkzeug=True)
 
 # Start Flask in a separate thread
 flask_thread = threading.Thread(target=run_flask, daemon=True)
